@@ -17,7 +17,7 @@ import (
 
 // framework
 
-type StateMachineBehavior[T gen.Process] interface {
+type StateMachineBehavior[T any] interface {
 	gen.ProcessBehavior
 
 	Init(args ...any) (StateMachineSpec[T], error)
@@ -30,12 +30,10 @@ type StateMachineBehavior[T gen.Process] interface {
 
 	HandleInspect(from gen.PID, item ...string) map[string]string
 
-	//TODO: HandleCall, HandleTerminate
-
 	CurrentState() gen.Atom
 }
 
-type StateMachine[T gen.Process] struct {
+type StateMachine[T any] struct {
 	gen.Process
 
 	behavior StateMachineBehavior[T]
@@ -57,10 +55,7 @@ type StateMachineSpec[T any] struct {
 func (sm *StateMachine[T]) ProcessInit(process gen.Process, args ...any) (rr error) {
 	var ok bool
 
-	fmt.Printf("In ProcessInit... %v\n", process.Behavior())
-
 	if sm.behavior, ok = process.Behavior().(StateMachineBehavior[T]); ok == false {
-		fmt.Printf("error with behavior %v\n", process.Behavior())
 		unknown := strings.TrimPrefix(reflect.TypeOf(process.Behavior()).String(), "*")
 		return fmt.Errorf("ProcessInit: not a StateMachineBehavior %s", unknown)
 	}
@@ -83,8 +78,6 @@ func (sm *StateMachine[T]) ProcessInit(process gen.Process, args ...any) (rr err
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("Got spec: %v\n", spec)
 
 	// set up callbacks
 	sm.currentState = spec.initialState
@@ -151,45 +144,35 @@ func (sm *StateMachine[T]) ProcessRun() (rr error) {
 
 		switch message.Type {
 		case gen.MailboxMessageTypeRegular:
-			//  check if there is a registered handler, otherwise error
-			// TODO move to other place
-			typeName := reflect.TypeOf(message.Message).String()
-			fmt.Printf("current state: %s, type: %s\n", sm.currentState, typeName)
-			if stateCallbacks, exists := sm.stateCallbacks[sm.currentState]; exists == true {
-				fmt.Println("found callbacs for state")
-				if callback, exists := stateCallbacks[typeName]; exists == true {
-					fmt.Printf("found callback for type: %s\n", typeName)
-					reason := callback.f((T)(sm.Process.(T)), message)
-					if reason != nil {
-						return reason
-					}
-				}
+			// check if there is a handler for the message in the current state
+			typeName := typeName(message)
+			if callback, ok := sm.lookupCallback(typeName); ok == true {
+				return callback(sm, message.Message)
 			}
-			return fmt.Errorf("Unsupported message %s for state %s", sm.currentState, typeName)
-			//			if reason := sm.behavior.HandleMessage(message.From, message.Message); reason != nil {
-			//				return reason
-			//			}
+			return fmt.Errorf("Unsupported message %s for state %s", typeName, sm.currentState)
 
 		case gen.MailboxMessageTypeRequest:
 			var reason error
-			var result any
+			var result gen.Atom = sm.CurrentState()
 
-			// check if there is a registered handler, otherwise error
-			result, reason = sm.behavior.HandleCall(message.From, message.Ref, message.Message)
+			// check if there is a handler for the call in the current state
+			typeName := typeName(message)
+			if callback, ok := sm.lookupCallback(typeName); ok == true {
+				reason = callback(sm, message.Message)
+				result = sm.CurrentState()
+			} else {
+				reason = fmt.Errorf("Unsupported call %s for state %s", typeName, sm.currentState)
+			}
 
 			if reason != nil {
 				// if reason is "normal" and we got response - send it before termination
-				if reason == gen.TerminateReasonNormal && result != nil {
+				if reason == gen.TerminateReasonNormal {
 					sm.SendResponse(message.From, message.Ref, result)
 				}
 				return reason
 			}
 
-			if result == nil {
-				// async handling of sync request. response could be sent
-				// later, even by the other process
-				continue
-			}
+			// Note: we do not support async handling of sync request at the moment
 
 			sm.SendResponse(message.From, message.Ref, result)
 
@@ -258,9 +241,7 @@ func (s *StateMachine[T]) CurrentState() gen.Atom {
 	return s.currentState
 }
 
-type StateCallback[T any] struct {
-	f func(actor T, message any) error
-}
+type StateCallback[T any] func(*StateMachine[T], any) error
 
 type Callback[T any] func(*StateMachineSpec[T])
 
@@ -275,59 +256,55 @@ func NewStateMachineSpec[T any](initialState gen.Atom, callbacks ...Callback[T])
 	return spec
 }
 
-func WithStateCallback[SpecType any, MessageType any](state gen.Atom, callback func(SpecType, any) error) Callback[SpecType] {
+func WithStateCallback[SpecType any, MessageType any](state gen.Atom, callback func(*StateMachine[SpecType], any) error) Callback[SpecType] {
 	typeName := reflect.TypeOf((*MessageType)(nil)).Elem().String()
 	return func(s *StateMachineSpec[SpecType]) {
 		if _, exists := s.stateCallbacks[state]; exists == false {
 			s.stateCallbacks[state] = make(map[string]StateCallback[SpecType])
 		}
-		s.stateCallbacks[state][typeName] = StateCallback[SpecType]{callback}
+		s.stateCallbacks[state][typeName] = callback
 	}
+}
+
+// internals
+
+func typeName(message *gen.MailboxMessage) string {
+	return reflect.TypeOf(message.Message).String()
+}
+
+func (sm *StateMachine[T]) lookupCallback(messageType string) (StateCallback[T], bool) {
+	if stateCallbacks, exists := sm.stateCallbacks[sm.currentState]; exists == true {
+		if callback, exists := stateCallbacks[messageType]; exists == true {
+			return callback, true
+		}
+	}
+	return nil, false
 }
 
 // client
 
+type ClimbData struct {
+}
+
 type Climber struct {
-	StateMachine[*Climber]
+	StateMachine[ClimbData]
 }
 
 func factoryClimber() gen.ProcessBehavior {
 	return &Climber{}
 }
 
-func (c *Climber) Init(args ...any) (StateMachineSpec[*Climber], error) {
-	fmt.Println("In climber init")
-
+func (c *Climber) Init(args ...any) (StateMachineSpec[ClimbData], error) {
 	spec := NewStateMachineSpec(gen.Atom("ready"),
-		WithStateCallback[*Climber, Belay](gen.Atom("ready"), belay),
-		WithStateCallback[*Climber, Climbing](gen.Atom("on_belay"), climbing),
-		WithStateCallback[*Climber, Climb](gen.Atom("climb_on"), climb),
+		WithStateCallback[ClimbData, Belay](gen.Atom("ready"), belay),
+		WithStateCallback[ClimbData, Climbing](gen.Atom("on_belay"), climbing),
+		WithStateCallback[ClimbData, Climb](gen.Atom("climb_on"), climb),
 	)
 
 	c.Log().Info("Climber started in %s state", c.State())
 
 	return spec, nil
 }
-
-// func (c *Climber) HandleMessage(from gen.PID, message any) error {
-//  switch m := message.(type) {
-//  case Belay:
-//      c.Log().Info("Got ya!")
-//      c.state = gen.Atom("on_belay")
-//      return nil
-//  case Climbing:
-//      c.Log().Info("Go for it!")
-//      c.state = gen.Atom("climb_on")
-//      return nil
-//  case Climb:
-//      c.Log().Info("Be careful...")
-//      m.f()
-//      c.Log().Info("Great climb!")
-//      c.state = gen.Atom("ready")
-//  }
-//
-//  return nil
-//}
 
 type Belay struct{}
 
@@ -337,32 +314,32 @@ type Climb struct {
 	f func()
 }
 
-func belay(c *Climber, message any) error {
-	c.Log().Info("Got ya!")
+func belay(sm *StateMachine[ClimbData], message any) error {
+	sm.Log().Info("Got ya!")
+	sm.currentState = gen.Atom("on_belay")
 	return nil
 }
 
-func climbing(c *Climber, message any) error {
-	c.Log().Info("Go for it!")
+func climbing(sm *StateMachine[ClimbData], message any) error {
+	sm.Log().Info("Go for it!")
+	sm.currentState = gen.Atom("climb_on")
 	return nil
 }
 
-func climb(c *Climber, message any) error {
+func climb(sm *StateMachine[ClimbData], message any) error {
 	var ok bool
 	var m Climb
 
 	if m, ok = message.(Climb); ok == false {
 		return errors.New("we have a problem")
 	}
-	c.Log().Info("Be careful...")
+	sm.Log().Info("Be careful...")
 	m.f()
-	c.Log().Info("Great climb!")
+	sm.Log().Info("Great climb!")
 	return nil
 }
 
 func main() {
-	fmt.Println("Hello, Ergo!")
-
 	var opts gen.NodeOptions
 	node, err := ergo.StartNode("climber@localhost", opts)
 
@@ -372,15 +349,12 @@ func main() {
 
 	var _ gen.Process = (*Climber)(nil)
 
-	fmt.Println("Starting climber")
 	_, err = node.SpawnRegister("climber", factoryClimber, gen.ProcessOptions{})
 
-	fmt.Println("Climber started")
 	node.Send(gen.Atom("climber"), Belay{})
-	//  node.Send(gen.Atom("climber"), Climbing{})
-	//  node.Send(gen.Atom("climber"), Climb{f: func() { fmt.Println("Weeeeeee, I'm climbing!") }})
+	//node.Send(gen.Atom("climber"), Belay{}) // this will throw an unsupported message for state exception
+	node.Send(gen.Atom("climber"), Climbing{})
+	node.Send(gen.Atom("climber"), Climb{f: func() { fmt.Println("Weeeeeee, I'm climbing!") }})
 
 	node.Wait()
-
-	fmt.Println("Exiting...")
 }
