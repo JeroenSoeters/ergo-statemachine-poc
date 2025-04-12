@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -16,13 +17,7 @@ import (
 
 // framework
 
-type StateCallback[T any] struct {
-	state    gen.Atom
-	message  reflect.Type
-	callback func(actor T, from gen.PID, message any) error
-}
-
-type StateMachineBehavior[T any] interface {
+type StateMachineBehavior[T gen.Process] interface {
 	gen.ProcessBehavior
 
 	Init(args ...any) (StateMachineSpec[T], error)
@@ -37,21 +32,24 @@ type StateMachineBehavior[T any] interface {
 
 	//TODO: HandleCall, HandleTerminate
 
-	State() gen.Atom
+	CurrentState() gen.Atom
 }
 
-type StateMachine[T any] struct {
+type StateMachine[T gen.Process] struct {
 	gen.Process
 
 	behavior StateMachineBehavior[T]
 	mailbox  gen.ProcessMailbox
 
 	spec StateMachineSpec[T]
+
+	currentState   gen.Atom
+	stateCallbacks map[gen.Atom]map[string]StateCallback[T]
 }
 
 type StateMachineSpec[T any] struct {
 	initialState   gen.Atom
-	stateCallbacks []StateCallback[T]
+	stateCallbacks map[gen.Atom]map[string]StateCallback[T]
 }
 
 // ProcessBehavior implementation
@@ -89,11 +87,13 @@ func (sm *StateMachine[T]) ProcessInit(process gen.Process, args ...any) (rr err
 	fmt.Printf("Got spec: %v\n", spec)
 
 	// set up callbacks
+	sm.currentState = spec.initialState
+	sm.stateCallbacks = spec.stateCallbacks
 
 	return nil
 }
 
-func (sm *StateMachine[T]) ProcessRuAn() (rr error) {
+func (sm *StateMachine[T]) ProcessRun() (rr error) {
 	var message *gen.MailboxMessage
 
 	if lib.Recover() {
@@ -152,9 +152,23 @@ func (sm *StateMachine[T]) ProcessRuAn() (rr error) {
 		switch message.Type {
 		case gen.MailboxMessageTypeRegular:
 			//  check if there is a registered handler, otherwise error
-			if reason := sm.behavior.HandleMessage(message.From, message.Message); reason != nil {
-				return reason
+			// TODO move to other place
+			typeName := reflect.TypeOf(message.Message).String()
+			fmt.Printf("current state: %s, type: %s\n", sm.currentState, typeName)
+			if stateCallbacks, exists := sm.stateCallbacks[sm.currentState]; exists == true {
+				fmt.Println("found callbacs for state")
+				if callback, exists := stateCallbacks[typeName]; exists == true {
+					fmt.Printf("found callback for type: %s\n", typeName)
+					reason := callback.f((T)(sm.Process.(T)), message)
+					if reason != nil {
+						return reason
+					}
+				}
 			}
+			return fmt.Errorf("Unsupported message %s for state %s", sm.currentState, typeName)
+			//			if reason := sm.behavior.HandleMessage(message.From, message.Message); reason != nil {
+			//				return reason
+			//			}
 
 		case gen.MailboxMessageTypeRequest:
 			var reason error
@@ -216,6 +230,61 @@ func (sm *StateMachine[T]) ProcessRuAn() (rr error) {
 func (sm *StateMachine[T]) ProcessTerminate(reason error) {
 }
 
+//
+// StateMachineBehavior default callbacks
+//
+
+func (s *StateMachine[T]) HandleMessage(from gen.PID, message any) error {
+	s.Log().Warning("StateMachine.HandleMessage: unhandled message from %s", from)
+	return nil
+}
+
+func (s *StateMachine[T]) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
+	s.Log().Warning("StateMachine.HandleCall: unhandled request from %s", from)
+	return nil, nil
+}
+func (s *StateMachine[T]) HandleEvent(message gen.MessageEvent) error {
+	s.Log().Warning("StateMachine.HandleEvent: unhandled event message %#v", message)
+	return nil
+}
+
+func (s *StateMachine[T]) HandleInspect(from gen.PID, item ...string) map[string]string {
+	return nil
+}
+
+func (s *StateMachine[T]) Terminate(reason error) {}
+
+func (s *StateMachine[T]) CurrentState() gen.Atom {
+	return s.currentState
+}
+
+type StateCallback[T any] struct {
+	f func(actor T, message any) error
+}
+
+type Callback[T any] func(*StateMachineSpec[T])
+
+func NewStateMachineSpec[T any](initialState gen.Atom, callbacks ...Callback[T]) StateMachineSpec[T] {
+	spec := StateMachineSpec[T]{
+		initialState:   initialState,
+		stateCallbacks: make(map[gen.Atom]map[string]StateCallback[T]),
+	}
+	for _, cb := range callbacks {
+		cb(&spec)
+	}
+	return spec
+}
+
+func WithStateCallback[SpecType any, MessageType any](state gen.Atom, callback func(SpecType, any) error) Callback[SpecType] {
+	typeName := reflect.TypeOf((*MessageType)(nil)).Elem().String()
+	return func(s *StateMachineSpec[SpecType]) {
+		if _, exists := s.stateCallbacks[state]; exists == false {
+			s.stateCallbacks[state] = make(map[string]StateCallback[SpecType])
+		}
+		s.stateCallbacks[state][typeName] = StateCallback[SpecType]{callback}
+	}
+}
+
 // client
 
 type Climber struct {
@@ -228,10 +297,12 @@ func factoryClimber() gen.ProcessBehavior {
 
 func (c *Climber) Init(args ...any) (StateMachineSpec[*Climber], error) {
 	fmt.Println("In climber init")
-	spec := StateMachineSpec[*Climber]{
-		initialState:   gen.Atom("ready"),
-		stateCallbacks: []StateCallback[*Climber]{},
-	}
+
+	spec := NewStateMachineSpec(gen.Atom("ready"),
+		WithStateCallback[*Climber, Belay](gen.Atom("ready"), belay),
+		WithStateCallback[*Climber, Climbing](gen.Atom("on_belay"), climbing),
+		WithStateCallback[*Climber, Climb](gen.Atom("climb_on"), climb),
+	)
 
 	c.Log().Info("Climber started in %s state", c.State())
 
@@ -255,7 +326,7 @@ func (c *Climber) Init(args ...any) (StateMachineSpec[*Climber], error) {
 //      c.state = gen.Atom("ready")
 //  }
 //
-//	return nil
+//  return nil
 //}
 
 type Belay struct{}
@@ -266,8 +337,26 @@ type Climb struct {
 	f func()
 }
 
-func belay(c *Climber, from gen.PID, message any) error {
+func belay(c *Climber, message any) error {
 	c.Log().Info("Got ya!")
+	return nil
+}
+
+func climbing(c *Climber, message any) error {
+	c.Log().Info("Go for it!")
+	return nil
+}
+
+func climb(c *Climber, message any) error {
+	var ok bool
+	var m Climb
+
+	if m, ok = message.(Climb); ok == false {
+		return errors.New("we have a problem")
+	}
+	c.Log().Info("Be careful...")
+	m.f()
+	c.Log().Info("Great climb!")
 	return nil
 }
 
@@ -281,13 +370,15 @@ func main() {
 		panic(err)
 	}
 
+	var _ gen.Process = (*Climber)(nil)
+
 	fmt.Println("Starting climber")
 	_, err = node.SpawnRegister("climber", factoryClimber, gen.ProcessOptions{})
 
 	fmt.Println("Climber started")
-	//	node.Send(gen.Atom("climber"), Belay{})
-	//	node.Send(gen.Atom("climber"), Climbing{})
-	//	node.Send(gen.Atom("climber"), Climb{f: func() { fmt.Println("Weeeeeee, I'm climbing!") }})
+	node.Send(gen.Atom("climber"), Belay{})
+	//  node.Send(gen.Atom("climber"), Climbing{})
+	//  node.Send(gen.Atom("climber"), Climb{f: func() { fmt.Println("Weeeeeee, I'm climbing!") }})
 
 	node.Wait()
 
